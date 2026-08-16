@@ -1,5 +1,8 @@
 {
-  "test_date": "2026-08-16T09:51:45+00:00",
-  "urls_tested": 200,
-  "urls_passed": 100
+  "test_date": "2026-08-16T10:38:50+00:00",
+  "source": "https://raw.githubusercontent.com/sacuar/MyIPTV/refs/heads/main/adult.m3u",
+  "total_candidates": 14872,
+  "urls_tested": 14872,
+  "urls_passed": 14872,
+  "urls_failed": 0
 }
