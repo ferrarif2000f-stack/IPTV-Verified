@@ -1,0 +1,44 @@
+name: Verify HLS streams
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - verify_hls.py
+      - .github/workflows/verify.yml
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify streams
+        run: python verify_hls.py
+      - name: Validate generated files
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          lines = Path("verified-100.m3u").read_text(encoding="utf-8").splitlines()
+          assert lines[0] == "#EXTM3U"
+          assert sum(line.startswith("#EXTINF:") for line in lines) == 100
+          assert sum(line.startswith(("http://", "https://")) for line in lines) == 100
+          report = json.loads(Path("verification-report.json").read_text(encoding="utf-8"))
+          assert report["urls_passed"] == 100
+          PY
+      - name: Commit verified playlist
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add verified-100.m3u verification-report.json
+          git commit -m "Add 100 verified HLS streams [skip ci]"
+          git push origin HEAD:main
