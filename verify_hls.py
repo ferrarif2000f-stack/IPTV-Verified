@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an M3U playlist from HLS streams whose first segment is downloadable."""
+"""Build M3U playlists containing every HLS stream with a downloadable segment."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import argparse
 import concurrent.futures
 import json
 import ssl
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,8 +15,10 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 
-SOURCE_URL = "https://raw.githubusercontent.com/sacuar/MyIPTV/main/adult.m3u"
+SOURCE_URL = "https://raw.githubusercontent.com/sacuar/MyIPTV/refs/heads/main/adult.m3u"
 USER_AGENT = "Mozilla/5.0 (compatible; IPTV-Verified/1.0)"
+PLAYLIST_LIMIT = 2 * 1024 * 1024
+SEGMENTS_TO_TRY = 4
 
 
 @dataclass(frozen=True)
@@ -36,14 +37,20 @@ def fetch(url: str, timeout: float, *, limit: int | None = None) -> tuple[int, b
 def parse_source(data: bytes) -> list[Entry]:
     text = data.decode("utf-8-sig", errors="replace")
     entries: list[Entry] = []
+    seen_urls: set[str] = set()
     info: str | None = None
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if line.startswith("#EXTINF:"):
             info = line
         elif line and not line.startswith("#"):
-            if info is not None and ".m3u8" in line.lower():
+            if (
+                info is not None
+                and ".m3u8" in line.lower()
+                and line not in seen_urls
+            ):
                 entries.append(Entry(info, line))
+                seen_urls.add(line)
             info = None
     return entries
 
@@ -78,9 +85,9 @@ def referenced_uris(text: str, marker: str | None = None) -> list[str]:
 
 
 def media_has_segment(url: str, text: str, timeout: float) -> bool:
-    for uri in referenced_uris(text):
+    for uri in referenced_uris(text)[:SEGMENTS_TO_TRY]:
         try:
-            status, body, _ = fetch(urljoin(url, uri), timeout, limit=1024)
+            status, body, _ = fetch(urljoin(url, uri), timeout, limit=1)
             if status == 200 and body:
                 return True
         except (HTTPError, URLError, TimeoutError, OSError, ValueError):
@@ -90,7 +97,7 @@ def media_has_segment(url: str, text: str, timeout: float) -> bool:
 
 def verify(entry: Entry, timeout: float) -> bool:
     try:
-        status, body, final_url = fetch(entry.url, timeout)
+        status, body, final_url = fetch(entry.url, timeout, limit=PLAYLIST_LIMIT)
         if status != 200:
             return False
         text = body.decode("utf-8-sig", errors="replace")
@@ -102,7 +109,9 @@ def verify(entry: Entry, timeout: float) -> bool:
 
         for variant in referenced_uris(text, "#EXT-X-STREAM-INF:"):
             try:
-                status, media_body, media_url = fetch(urljoin(final_url, variant), timeout)
+                status, media_body, media_url = fetch(
+                    urljoin(final_url, variant), timeout, limit=PLAYLIST_LIMIT
+                )
                 if status != 200:
                     continue
                 media_text = media_body.decode("utf-8-sig", errors="replace")
@@ -117,17 +126,27 @@ def verify(entry: Entry, timeout: float) -> bool:
     return False
 
 
-def write_outputs(entries: list[Entry], tested: int, output: Path, report: Path) -> None:
-    output.write_text(
-        "#EXTM3U\n" + "".join(f"{entry.info}\n{entry.url}\n" for entry in entries),
-        encoding="utf-8",
+def write_outputs(
+    entries: list[Entry],
+    total_candidates: int,
+    source: str,
+    outputs: list[Path],
+    report: Path,
+) -> None:
+    playlist = "#EXTM3U\n" + "".join(
+        f"{entry.info}\n{entry.url}\n" for entry in entries
     )
+    for output in outputs:
+        output.write_text(playlist, encoding="utf-8")
     report.write_text(
         json.dumps(
             {
                 "test_date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "urls_tested": tested,
+                "source": source,
+                "total_candidates": total_candidates,
+                "urls_tested": total_candidates,
                 "urls_passed": len(entries),
+                "urls_failed": total_candidates - len(entries),
             },
             indent=2,
         )
@@ -139,37 +158,30 @@ def write_outputs(entries: list[Entry], tested: int, output: Path, report: Path)
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default=SOURCE_URL)
-    parser.add_argument("--output", type=Path, default=Path("verified-100.m3u"))
+    parser.add_argument("--output", type=Path, default=Path("verified-all.m3u"))
+    parser.add_argument("--legacy-output", type=Path, default=Path("verified-100.m3u"))
     parser.add_argument("--report", type=Path, default=Path("verification-report.json"))
-    parser.add_argument("--count", type=int, default=100)
     parser.add_argument("--timeout", type=float, default=8.0)
-    parser.add_argument("--workers", type=int, default=32)
-    parser.add_argument("--batch-size", type=int, default=200)
+    parser.add_argument("--workers", type=int, default=64)
     args = parser.parse_args()
 
     status, source_data, _ = fetch(args.source, args.timeout)
     if status != 200:
         raise RuntimeError(f"source returned HTTP {status}")
     candidates = parse_source(source_data)
-    passed: list[Entry] = []
-    tested = 0
+    print(f"Testing all {len(candidates)} unique HLS candidates...", flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+        results = list(executor.map(lambda item: verify(item, args.timeout), candidates))
+    passed = [entry for entry, ok in zip(candidates, results) if ok]
 
-    for start in range(0, len(candidates), args.batch_size):
-        batch = candidates[start : start + args.batch_size]
-        print(f"Testing {start + 1}-{start + len(batch)} of {len(candidates)}...", flush=True)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-            results = list(executor.map(lambda item: verify(item, args.timeout), batch))
-        tested += len(batch)
-        passed.extend(entry for entry, ok in zip(batch, results) if ok)
-        if len(passed) >= args.count:
-            passed = passed[: args.count]
-            break
-
-    if len(passed) != args.count:
-        print(f"Only {len(passed)} working streams found after {tested} tests", file=sys.stderr)
-        return 1
-    write_outputs(passed, tested, args.output, args.report)
-    print(f"Wrote {len(passed)} verified entries after testing {tested} URLs")
+    write_outputs(
+        passed,
+        len(candidates),
+        args.source,
+        [args.output, args.legacy_output],
+        args.report,
+    )
+    print(f"Wrote {len(passed)} verified entries after testing {len(candidates)} URLs")
     return 0
 
 

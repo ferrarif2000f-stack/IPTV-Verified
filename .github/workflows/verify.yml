@@ -14,7 +14,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,17 +28,25 @@ jobs:
           import json
           from pathlib import Path
 
-          lines = Path("verified-100.m3u").read_text(encoding="utf-8").splitlines()
-          assert lines[0] == "#EXTM3U"
-          assert sum(line.startswith("#EXTINF:") for line in lines) == 100
-          assert sum(line.startswith(("http://", "https://")) for line in lines) == 100
+          verified_all = Path("verified-all.m3u").read_bytes()
+          verified_legacy = Path("verified-100.m3u").read_bytes()
+          assert verified_all == verified_legacy
+          lines = verified_all.decode("utf-8").splitlines()
+          assert lines and lines[0] == "#EXTM3U"
+          info_count = sum(line.startswith("#EXTINF:") for line in lines)
+          urls = [line for line in lines if line.startswith(("http://", "https://"))]
+          assert info_count == len(urls)
+          assert len(urls) == len(set(urls))
           report = json.loads(Path("verification-report.json").read_text(encoding="utf-8"))
-          assert report["urls_passed"] == 100
+          assert report["source"] == "https://raw.githubusercontent.com/sacuar/MyIPTV/refs/heads/main/adult.m3u"
+          assert report["total_candidates"] == report["urls_tested"]
+          assert report["urls_passed"] == len(urls)
+          assert report["urls_failed"] == report["urls_tested"] - len(urls)
           PY
       - name: Commit verified playlist
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add verified-100.m3u verification-report.json
-          git commit -m "Add 100 verified HLS streams [skip ci]"
+          git add verified-all.m3u verified-100.m3u verification-report.json
+          git commit -m "Update all verified HLS streams [skip ci]"
           git push origin HEAD:main
